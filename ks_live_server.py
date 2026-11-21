@@ -33,15 +33,25 @@ LISTEN_PORT = 8765
 PROFILE_PATH = '/home/zm/zmbot/astrbot_plugin_LinkFlow_aux/ks-mitm.yaml'
 WAIT_TIMEOUT = 20.0
 
+# 物理关屏工具(ScreenPower): app_process 直调 SurfaceControl.setDisplayPowerMode
+#   - 设备端 dex 由 keepalive.sh 推到 /data/local/tmp/screenpower.dex
+#   - 机制与 scrcpy 3.x 的 "Device display turned off" 完全一致:
+#     直接作用于 SurfaceFlinger, 屏幕真正黑掉, 但 **不经过 PowerManager**
+#     => mWakefulness 保持 Awake, Activity 不 onStop, 深链/intent 照常投递。
+#   - 对比 input keyevent 26 (KEYCODE_SLEEP): 会进 mWakefulness=Dozing,
+#     Activity 被吞, 快手不发 info2 -> 必 504。
+SCREENPOWER_DEX = '/data/local/tmp/screenpower.dex'
+KEEP_AWAKE_SH = '/data/local/tmp/keep_awake.sh'
+SCREENPOWER_TIMEOUT = 15
+
 _lock = threading.Lock()
 _info2_cache = {}  # photo_id(str) -> parsed result
 _info2_ts = {}  # photo_id(str) -> cached time
 _CACHE_TTL = 1800.0  # cached URLs expire (CDN pkey has TTL), 30min
 _info2_err = {}  # photo_id(str) -> (ts, error dict) 错误响应快速通道, 不进主缓存
 _pend_request = None  # 正在等的 photo_id
-_woke_screen = False  # 本次请求是否因深链拉黑背光醒来(用完灭回去)
-_saved_brightness = None  # 唤醒前的系统亮度, 用完还原
-_saved_brightness_mode = None  # 唤醒前的亮度模式(0手动/1自动), 用完还原
+_physical_off = False  # 本次请求是否已物理关屏(解析链路不自动点亮, 仅日志用)
+_screen_power_ok = None  # None=未探测 True/False=设备端能力
 
 
 def _adb_shell(*args, timeout=10):
@@ -49,86 +59,164 @@ def _adb_shell(*args, timeout=10):
                           capture_output=True, timeout=timeout)
 
 
-def _screen_off():
-    """屏幕是否处于不可用状态(灭屏 或 锁屏)。
-    ⚠️ 2026-11-08 踩坑: 原来只看 'Display Power: state=OFF'。
-       实际挂机平板经常是【屏幕亮着但处于锁屏】(Display Power: state=ON
-       + isKeyguardShowing=true), 这种状态下深链同样会被系统吞掉
-       (Activity 直接 onStop, 不发 info2) -> 504。
-       现象: 截图显示锁屏界面"上滑解锁", App 进程在但详情页没渲染。"""
+def _screenpower(mode='probe'):
+    """调用设备端 ScreenPower 工具。
+
+    mode: 'probe' 只探测能力不改状态 / 'off' 物理关屏 / 'on' 恢复显示。
+    返回 (ok, output)。设备端 dex 缺失或方法不可用时返回 (False, 原因)。
+    """
     try:
-        out = _adb_shell('dumpsys', 'power').stdout.decode('utf-8', 'ignore')
-        if 'Display Power: state=OFF' in out:
-            return True
-    except Exception:
-        pass
-    try:
-        out = _adb_shell('dumpsys', 'window').stdout.decode('utf-8', 'ignore')
-        if 'isKeyguardShowing=true' in out:
-            return True
-    except Exception:
-        pass
-    return False
+        r = subprocess.run(
+            [ADB, '-s', ADB_SERIAL, 'shell',
+             f'CLASSPATH={SCREENPOWER_DEX} app_process /data/local/tmp ScreenPower {mode}'],
+            capture_output=True, timeout=SCREENPOWER_TIMEOUT)
+        out = (r.stdout + r.stderr).decode('utf-8', 'ignore')
+        ok = ('OK' in out) or ('PROBE OK' in out)
+        return ok, out.strip()
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
 
 
-def _dim_wake():
-    """背光拉黑式唤醒: 灭屏时 am start 的深链会被系统吞掉(Activity 直接
-    onStop, 不发 info2), 必须让屏幕处于活动态; 但挂机平板不能真亮屏,
-    所以先存亮度/亮度模式->手动模式亮度0->亮屏, 屏幕是"开"的、光是灭的
-    (OLED 亮度0 = 像素不发光, 真黑屏, 也无烧屏风险)。"""
-    global _saved_brightness, _saved_brightness_mode
-    try:
-        cur = _adb_shell('settings', 'get', 'system', 'screen_brightness') \
-            .stdout.decode('utf-8', 'ignore').strip()
-        _saved_brightness = cur if cur.isdigit() else None
-        mode = _adb_shell('settings', 'get', 'system', 'screen_brightness_mode') \
-            .stdout.decode('utf-8', 'ignore').strip()
-        _saved_brightness_mode = mode if mode.isdigit() else None
-    except Exception:
-        _saved_brightness = _saved_brightness_mode = None
-    try:
-        _adb_shell('settings', 'put', 'system', 'screen_brightness_mode', '0')
-        _adb_shell('settings', 'put', 'system', 'screen_brightness', '0')
-    except Exception:
-        pass
-    try:
-        _adb_shell('input', 'keyevent', 'KEYCODE_WAKEUP')
-        _adb_shell('wm', 'dismiss-keyguard')
-    except Exception:
-        pass
-    # dismiss-keyguard 在锁屏(尤其有密码/通知栏展开)时可能一次不生效,
-    # 轮询确认, 最多等 6s —— 不解锁的话深链必被吞(必 504)
-    # 注意: 不用 KEYCODE_BACK 收通知栏(会连带退出快手 App, 反而坏事)
-    for _ in range(6):
-        try:
-            out = _adb_shell('dumpsys', 'window').stdout.decode('utf-8', 'ignore')
-            if 'isKeyguardShowing=true' not in out:
-                break
-        except Exception:
-            break
-        _adb_shell('input', 'keyevent', 'KEYCODE_MENU')  # 部分 ROM 用 MENU 消 keyguard
-        _adb_shell('wm', 'dismiss-keyguard')
-        time.sleep(1.0)
+def _probe_screen_power():
+    """探测设备端是否支持 SurfaceControl.setDisplayPowerMode(OFF), 结果缓存。"""
+    global _screen_power_ok
+    if _screen_power_ok is not None:
+        return _screen_power_ok
+    ok, out = _screenpower('probe')
+    _screen_power_ok = ok
+    ctx.log.info(f'[ks_live] screenpower probe: ok={ok} {out}')
+    return ok
 
 
-def _sleep_restore():
-    """灭屏 + 还原亮度与亮度模式(先灭后还原, 下次手动亮屏显示正常)"""
+def _enable_stay_awake():
+    """保持设备唤醒(防自动进 Dozing) —— 真插电 + scrcpy 官方 stay-awake。
+
+    ★ 最终方案(2026-11-09 03:10 端到端实测确定):
+
+    平板**物理插着 AC**(mPlugType=1, AC powered:true, status:2 充电中),
+    此时只需一条 Settings.Global 就能让 framework 永不 goToSleep:
+
+        settings put global stay_on_while_plugged_in 7
+
+    这是 scrcpy --stay-awake 反编译出来的官方实现(7 = AC|USB|无线)。
+    AOSP PowerManagerService.isBeingKeptAwakeLocked() 判定
+    `mStayOn && mPlugType != 0` -> 保持 mWakefulness=Awake。
+
+    ★ 为什么它比 userActivity 轮询好(决定性, 别改回去):
+      轮询每 5s 重置 mUserActivitySummary, 会让 App 窗口可见性反复抖动
+      (logcat: oldVis=0/4 来回切), 快手作品页因此**不发 info2** ->
+      /live_photo 必 504。stay_on 是「插电常亮」开关, 不制造任何用户活动
+      -> 窗口稳定。实测对照:
+        亮屏 + 无轮询        -> info2 ✅
+        轮询 + 物理黑屏      -> info2 ❌ 504
+        真插电 stay_on + 黑屏 -> info2 ✅ status=200, 7.91s, is_live=true
+
+    ★ 电池状态零污染: 不调 dumpsys battery set ac 1, 不伪造任何东西;
+      充电态就是设备真实状态。过充由硬件 BMS 负责, 与 framework 无关。
+
+    ⚠️ 这里不做任何 adb 调用(解析热路径要省 0.5~1s):
+      设置值由 _prepare_screen() 在同一条 adb shell 里幂等写入,
+      且 Settings.Global 持久化, 设备重启后仍在;
+      keepalive.sh 每分钟再兜底重设一次。
+    ⚠️ 绝不要在这里拉起 keep_awake.sh / KeepAwake 轮询守护 ——
+      那会把 info2 打掉。keepalive.sh 现在也只 stop 不 start。
+    """
+    return True
+
+
+def _keep_awake(action='status'):
+    """调用设备端 keep_awake.sh 守护脚本。返回 (ok, output)。"""
     try:
-        _adb_shell('input', 'keyevent', 'KEYCODE_SLEEP')
-    except Exception:
-        pass
-    if _saved_brightness is not None:
-        try:
-            _adb_shell('settings', 'put', 'system', 'screen_brightness',
-                       _saved_brightness)
-        except Exception:
-            pass
-    if _saved_brightness_mode is not None:
-        try:
-            _adb_shell('settings', 'put', 'system', 'screen_brightness_mode',
-                       _saved_brightness_mode)
-        except Exception:
-            pass
+        r = subprocess.run(
+            [ADB, '-s', ADB_SERIAL, 'shell',
+             f'sh {KEEP_AWAKE_SH} {action}'],
+            capture_output=True, timeout=20)
+        out = (r.stdout + r.stderr).decode('utf-8', 'ignore').strip()
+        # status 输出里 "running pids=" 才代表守护在跑;
+        # "not running" 里也含 "running" 子串, 不能用宽松匹配。
+        if action == 'status':
+            ok = 'running pids=' in out
+        else:
+            ok = 'running pids=' in out or 'started pids=' in out
+        return ok, out
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+def _wake_if_needed():
+    """重发路径的唤醒兜底 —— 真插电恒 Awake 下为空操作, 不做亮屏唤醒。
+
+    旧实现会 dumpsys power 判 mWakefulness, 不在 Awake 就发 KEYCODE_WAKEUP。
+    真插电 + stay_on_while_plugged_in=7 时 mStayOn=true、设备恒 Awake,
+    这套判定既冗余又慢(dumpsys power 单次好几秒, 重发路径更拖不起),
+    而唤醒动作本身还会点亮屏幕、多一次「亮了再压黑」的抖动。已停用。
+
+    保留函数只是让重发路径的调用点语义清晰; 恒返回 True(原本就 Awake)。
+    """
+    return True
+
+
+def _prepare_screen():
+    """一次 adb shell 完成「幂等保活设置 + 物理关屏」。
+
+    真插电 + stay_on_while_plugged_in=7 下 mStayOn=true、设备恒 Awake,
+    **不需要任何亮屏唤醒**(无 KEYCODE_WAKEUP / wakeUp / dumpsys power 判态)。
+    以前的「先查 mWakefulness, 不在 Awake 就 keyevent 224」已删除:
+      · 恒 Awake 时它是纯冗余, 而 dumpsys power 单次就要好几秒;
+      · 唤醒动作本身会点亮屏幕, 反而多一次「亮了再压黑」的抖动。
+
+    仍合并成一次 adb shell 的原因不变: 每次往返 0.5~1s, 分开会推迟深链,
+    叠加快手冷启动 4~5s 容易撞上重发阈值(实测撞过, 16.5s 才拿到结果)。
+    """
+    script = (
+        'settings put global stay_on_while_plugged_in 7 >/dev/null 2>&1; '
+        f'CLASSPATH={SCREENPOWER_DEX} app_process /data/local/tmp ScreenPower off'
+    )
+    try:
+        r = subprocess.run([ADB, '-s', ADB_SERIAL, 'shell', script],
+                           capture_output=True, timeout=25)
+        out = (r.stdout + r.stderr).decode('utf-8', 'ignore').strip()
+        ok = 'OK' in out
+        global _screen_power_ok, _physical_off
+        _screen_power_ok = ok
+        _physical_off = ok
+        if ok:
+            ctx.log.info(f'[ks_live] screen prepared (awake+off): {out}')
+        else:
+            ctx.log.warn(f'[ks_live] screen prepare failed: {out}')
+        return ok
+    except Exception as e:  # noqa: BLE001
+        ctx.log.warn(f'[ks_live] screen prepare error: {e}')
+        return False
+
+
+def _physical_screen_off():
+    """物理关屏(屏幕真黑, 系统仍活跃)。
+
+    拉深链前调用: 保证挂机平板黑屏状态下也能接收 intent,
+    且 App 冷启动/深链不会被系统吞掉。
+    失败(dex 缺失/ROM 不支持)时静默降级 —— 此时屏幕是亮的,
+    深链一样能工作, 只是会亮屏, 不影响功能正确性。
+    """
+    global _screen_power_ok, _physical_off
+    ok, out = _screenpower('off')
+    _screen_power_ok = ok
+    _physical_off = ok
+    if ok:
+        ctx.log.info(f'[ks_live] physical screen off: {out}')
+    else:
+        ctx.log.warn(f'[ks_live] physical screen off failed: {out}')
+    return ok
+
+
+def _physical_screen_on():
+    """恢复显示(手动亮屏用, 解析链路不自动调用)。"""
+    global _physical_off
+    ok, out = _screenpower('on')
+    if ok:
+        _physical_off = False
+        ctx.log.info(f'[ks_live] physical screen on: {out}')
+    return ok
 
 
 def _force_stop_app():
@@ -278,14 +366,41 @@ class KsLiveAddon:
         ctx.log.info(f'[ks_live] http server on :{LISTEN_PORT}')
 
 
-def _trigger_deep_link(photo_id):
-    """深链打开作品页。灭屏状态下 am start 会被系统吞掉不处理
-    (Activity 直接 onStop 不发 info2), 先背光拉黑式唤醒再打深链
-    (挂机平板 7x24 灭屏是常态, 不唤醒必 504; 背光为 0, 屏幕不亮)。"""
-    global _woke_screen
-    if _screen_off():
-        _dim_wake()
-        _woke_screen = True
+def _trigger_deep_link(photo_id, screen_off=True):
+    """深链打开作品页。
+
+    拉深链 **之前** 物理关屏(SurfaceControl.setDisplayPowerMode(OFF)):
+    屏幕真正黑掉, 但 mWakefulness 仍是 Awake, Activity 不会 onStop,
+    深链被正常投递, App 会照常发 info2。
+    与 input keyevent 26 (KEYCODE_SLEEP) 的区别: 后者进 Dozing,
+    深链必被系统吞掉 -> 504。
+
+    ⚠️ 2026-11-09 踩坑: 必须先 force-stop 再拉深链。
+       App 若已是热启动且正停在同一作品页, am start 只是 resume 已有
+       Activity, **不会重新请求 info2**(数据在 App 内部已缓存),
+       mitm 钩子等不到新响应 -> 必 504。
+       冷启动实测 ~1s 额外开销, 换 100% 可靠。
+
+    screen_off=False 用于 8s 无响应时的重发(第二次无需再关屏)。
+    """
+    # 顺序很关键, 一步都不能少:
+    #   1) 保持设备唤醒 —— Dozing 状态下 intent 会被系统吞掉, 物理关屏救不了。
+    #      真插电 + stay_on_while_plugged_in=7 让 framework 恒 Awake,
+    #      **无需任何亮屏唤醒**。
+    #   2) 幂等写入保活设置 + 物理关屏 —— 屏幕真黑, 系统仍 Awake。
+    #   3) force-stop App —— 保证冷启动, 否则热启动不会重发 info2。
+    #   4) 拉深链。
+    _enable_stay_awake()   # 恒 Awake, 零 adb 开销; 设置在下一步写入
+    # 2) 保活设置 + 物理关屏, **合并成一次 adb shell 调用**。
+    #    每次往返 0.5~1s, 分开会推迟深链, 叠加 App 冷启动 4~5s
+    #    容易撞上重发阈值(实测撞过, 16.5s 才拿到结果)。
+    if screen_off:
+        _prepare_screen()
+    else:
+        # 重发路径: 屏幕已经黑着; 恒 Awake 下无需唤醒(空操作)
+        _wake_if_needed()
+    _force_stop_app()
+    time.sleep(1.0)  # 等 App 进程真正退出, 否则 am start 可能命中旧进程
     uri = f'ksnebula://work/{photo_id}'
     try:
         subprocess.run([ADB, '-s', ADB_SERIAL, 'shell', 'am', 'start',
@@ -307,6 +422,9 @@ class Handler(BaseHTTPRequestHandler):
             self._file(PROFILE_PATH)
             return
         if u.path not in ('/live_photo', '/live_photo/'):
+            if u.path in ('/screen', '/screen/'):
+                self._screen_ctrl(u)
+                return
             self._json(404, {'result': 404, 'error': 'use /live_photo?photo_id=X'})
             return
         qs = urllib.parse.parse_qs(u.query)
@@ -324,8 +442,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # 深链触发，等 info2 响应（先清旧缓存防捞到过期直链）
-        global _woke_screen
-        _woke_screen = False
         with _lock:
             _info2_cache.pop(pid, None)
             _info2_ts.pop(pid, None)
@@ -343,30 +459,43 @@ class Handler(BaseHTTPRequestHandler):
                 err = _info2_err.get(pid)
             if item:
                 self._json(200, dict(item, cached=False))
-                if _woke_screen:
-                    _sleep_restore()
-                    _woke_screen = False
                 _force_stop_app()
                 return
             # 错误快速通道: 深链之后到达的错误响应(403/作品删除等), 立即返回,
             # 插件据此回落三方接口, 不用等满 20s
             if err and err[0] >= trigger_ts:
                 self._json(200, dict(err[1], cached=False))
-                if _woke_screen:
-                    _sleep_restore()
-                    _woke_screen = False
                 _force_stop_app()
                 return
             # 冷启动偶发深链被吞(App 起来了但没开作品页), 8s 没动静重发一次
-            if not retried and time.time() - trigger_ts > 8:
+            # 注意: 重发必须重新 force-stop -> 否则 am start 只是 resume 已有
+            # Activity, 不会重发 info2, 白等一轮(实测热启动必 504)。
+            if not retried and time.time() - trigger_ts > 12:
                 retried = True
-                ctx.log.info(f'[ks_live] no info2 in 8s, re-fire deep link for {pid}')
-                _trigger_deep_link(pid)
+                ctx.log.info(f'[ks_live] no info2 in 12s, re-fire deep link for {pid}')
+                _trigger_deep_link(pid, screen_off=False)
         self._json(504, {'result': 504, 'error': f'timeout waiting info2 for {pid}'})
-        if _woke_screen:
-            _sleep_restore()
-            _woke_screen = False
         _force_stop_app()
+
+    def _screen_ctrl(self, u):
+        """GET /screen?action=off|on|probe —— 手动物理关屏/亮屏。
+
+        解析链路会自动关屏, 但设备若被其它流程(如 scrcpy)改过状态,
+        可用这个接口显式恢复显示。
+        """
+        qs = urllib.parse.parse_qs(u.query)
+        action = (qs.get('action') or ['probe'])[0].strip().lower()
+        if action == 'off':
+            ok = _physical_screen_off()
+        elif action == 'on':
+            ok = _physical_screen_on()
+        elif action == 'probe':
+            ok = _probe_screen_power()
+        else:
+            self._json(400, {'result': 400, 'error': 'action=off|on|probe'})
+            return
+        self._json(200 if ok else 500, {'result': 200 if ok else 500, 'ok': ok,
+                                       'action': action})
 
     def _file(self, path):
         try:
@@ -384,11 +513,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # 插件侧超时先断开(旧版插件 total=8s < 服务端 20s)会走到这里,
+            # 不该把整个请求线程带崩; 记一条日志即可。
+            ctx.log.warn(f'[ks_live] client gone before response: {e}')
 
 
 def _serve():

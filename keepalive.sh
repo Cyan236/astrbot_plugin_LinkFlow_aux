@@ -15,6 +15,60 @@ if ! adb -s $SERIAL shell 'ls /system/etc/security/cacerts/' 2>/dev/null | grep 
 fi
 # 4) wake_lock 丢了补上
 adb -s $SERIAL shell 'cat /sys/power/wake_lock' 2>/dev/null | grep -q ksassist || adb -s $SERIAL shell "su -c 'echo ksassist > /sys/power/wake_lock'" >/dev/null 2>&1
+# 4.1) 保持设备唤醒(防自动进 Dozing) —— 真插电 + scrcpy 官方 stay-awake
+#      ★ 最终方案(2026-11-09 03:10 端到端实测确定):
+#        平板物理插着 AC(mPlugType=1, AC powered:true), 只需幂等写入
+#            settings put global stay_on_while_plugged_in 7
+#        AOSP isBeingKeptAwakeLocked(): mStayOn && mPlugType != 0 -> 恒 Awake。
+#        实测: 25s 全程 mWakefulness=Awake + mStayOn=true + powerMode=Off(0),
+#              端到端 /live_photo status=200, 7.91s, is_live=true。
+#      ★ **无需任何亮屏唤醒**: 设备恒 Awake, 不跑 keyevent/wakeUp/轮询,
+#        也没有「保活进程唤醒点亮屏幕 -> 再压黑」这套动作。
+#      ★ 绝不拉起 keep_awake.sh(userActivity 5s 轮询): 它会重置
+#        mUserActivitySummary 让快手窗口 oldVis=0/4 抖动、不发 info2 -> 504。
+#        实测对照: 亮屏无轮询 info2 ✅ / 轮询+黑屏 ❌ / 真插电 stay_on ✅。
+#      ★ 电池状态零污染: 不用 dumpsys battery set ac 1, 充电态是真实状态;
+#        过充由硬件 BMS 管, 与 framework 无关。
+#      已排除: wake lock(全 level)/keyevent 注入/screen_off_timeout 拉满/
+#              fake AC 伪造插电/userActivity 轮询守护。
+# 4.2) ScreenPower dex 推送(物理关屏工具, 机制同 scrcpy 的 setDisplayPowerMode)
+#      设备重启后 /data/local/tmp 会清空, 必须重新推; 缺失则 ks_live_server
+#      退化成"屏幕亮着也能解析"的降级模式, 深链虽正常但挂机平板会亮屏。
+if ! adb -s $SERIAL shell 'ls /data/local/tmp/screenpower.dex' 2>/dev/null | grep -q screenpower.dex; then
+  if [ -f "$AUX/screenpower.dex" ]; then
+    adb -s $SERIAL push "$AUX/screenpower.dex" /data/local/tmp/screenpower.dex >/dev/null 2>&1 \
+      && echo "[$(date '+%F %T')] screenpower.dex 已推送" >> $AUX/keepalive.log
+  else
+    echo "[$(date '+%F %T')] screenpower.dex 缺失(服务器端未部署)" >> $AUX/keepalive.log
+  fi
+fi
+# 4.25) 手动关屏脚本常驻设备(**只部署, 绝不执行**)
+#      ★ 2026-11-13: 服务器不再周期性关屏(原 4.4 黑屏兜底已删)。
+#        用户用完平板后自行「插回电 + adb shell sh /data/local/tmp/screen_off.sh」
+#        恢复挂机黑屏。设备重启后 /data/local/tmp 会清空, 这里按 md5 幂等补推,
+#        保证手动入口永远在; 一致时常态零开销(只多一次 adb shell)。
+LOCAL_MD5=$(md5sum "$AUX/screen_off.sh" 2>/dev/null | cut -d' ' -f1)
+REMOTE_MD5=$(adb -s $SERIAL shell 'md5sum /data/local/tmp/screen_off.sh' 2>/dev/null | tr -d '\r' | cut -d' ' -f1)
+if [ -n "$LOCAL_MD5" ] && [ "$REMOTE_MD5" != "$LOCAL_MD5" ]; then
+  adb -s $SERIAL push "$AUX/screen_off.sh" /data/local/tmp/screen_off.sh >/dev/null 2>&1 \
+    && adb -s $SERIAL shell 'chmod 755 /data/local/tmp/screen_off.sh' >/dev/null 2>&1 \
+    && echo "[$(date '+%F %T')] screen_off.sh 已推送(仅部署, 未执行)" >> $AUX/keepalive.log
+fi
+# 4.3) 真插电保活: 幂等写入 stay_on_while_plugged_in=7。
+#      Settings.Global 持久化, 设备重启后仍在; 每轮 keepalive(120s)兜底重设。
+#      断电时该值不生效(mPlugType=0), 属预期 —— 由用户插回电 + 手动跑
+#      screen_off.sh 恢复; 服务器不做假插电、不自动唤醒、不自动关屏。
+adb -s $SERIAL shell 'settings put global stay_on_while_plugged_in 7' >/dev/null 2>&1
+# 4.35) 反向自愈: 若 userActivity 轮询守护有残留, 一律停掉。
+#       它是 2026-11-09 的 504 元凶(窗口抖动 -> 快手不发 info2)。
+#       只在 PID 文件存在时才调 stop, 常态零开销。
+adb -s $SERIAL shell '[ -f /data/local/tmp/keep_awake.pid ] && sh /data/local/tmp/keep_awake.sh stop' >/dev/null 2>&1
+# 4.4) 【已删除 2026-11-13】黑屏兜底: 原来每 120s 读 SurfaceFlinger,
+#      发现 powerMode=On 就 ScreenPower off。用户日常点亮平板会被反复压黑
+#      (keepalive.log 每 2 分钟一条「屏幕被点亮, 已重新物理关屏」)。
+#      现在服务器**完全不碰屏幕**: 关屏只发生在两处 ——
+#        (a) 用户手动跑 /data/local/tmp/screen_off.sh
+#        (b) ks_live_server._prepare_screen() 解析请求到达时(业务必需)
 # 4.5) VPN 隧道没了则拉起 FlClash(取代已卸载的 NekoBox)
 #     FlClash 用启动广播请求 VPN; 拉起后 2 秒复查, 仍无 tun0 就记一条日志
 if ! adb -s $SERIAL shell ip addr show tun0 >/dev/null 2>&1; then
